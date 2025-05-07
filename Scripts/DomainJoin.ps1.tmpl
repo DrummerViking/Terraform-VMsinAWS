@@ -1,0 +1,156 @@
+﻿<Powershell>
+Function Write-log {
+    Param(
+        $Message,
+        $Type = "INFO"
+    )
+    if (-not(Test-Path "C:\Temp")) { New-Item -Path "C:\" -Name "Temp" -ItemType Directory -Force }
+    Add-Content -Value "$(Get-Date -Format u),$Type,$Message" -Path "C:\Temp\Bootstrap.log" -Force
+}
+Set-ExecutionPolicy Unrestricted -Force
+
+Write-log "Starting bootstrap script"
+$ServerName = "${server_name}"
+$DomainName = "${domain_name}"
+$AdminAccount = "${admin_name}"
+$AdminPass = "${admin_pass}"
+$DCIPAddress = "${dns_server}"
+
+(@'
+Function Write-log {
+    Param(
+        $Message,
+        $Type = "INFO"
+    )
+    if (-not(Test-Path "C:\Temp")) { New-Item -Path "C:\" -Name "Temp" -ItemType Directory -Force }
+    Add-Content -Value "$(Get-Date -Format u),$Type,$Message" -Path "C:\Temp\DomainJoin.log" -Force
+}
+
+try {
+    Write-Log "Configuring DNS server IP address to: {4}"
+    Set-DnsClientServerAddress -InterfaceAlias (Get-NetAdapter).InterfaceAlias -ServerAddresses {4} -ErrorAction Stop
+    Write-Log "Successfully configured DNS server IP address to: {4}"
+}
+catch {
+	Write-log "Failed to update DNS Server. Error message: $_" -Type "ERROR"
+    exit
+}
+
+Write-log "Wait 10 minutes for Active Directory to be ready"
+Start-sleep -seconds 600
+
+try {
+    Write-log "Wait for domain to be ready"
+    do{
+        $conn = test-netconnection rccad.lab -Port 389
+        start-sleep -seconds 30
+    }
+    while($conn.TcpTestSucceeded -eq $false)
+
+    # Wait for computer object to be ready
+    $SearchBase = "DC=$('{0}'.Split(".")[0]),DC=$('{0}'.Split(".")[1])"
+    $objDomain = New-Object System.DirectoryServices.DirectoryEntry("LDAP://{4}/$SearchBase","{3}","{2}")
+    $objSearcher = New-Object System.DirectoryServices.DirectorySearcher
+    $objSearcher.SearchRoot = $objDomain
+    $objSearcher.PageSize = 1000
+    $objSearcher.SizeLimit = 0
+    $objSearcher.Filter = "(SamAccountName={1}$)"
+    $objSearcher.SearchScope = "Subtree"
+    do{    
+        Write-log "Waiting for computer object to be ready"
+        $Results = $objSearcher.FindAll()
+        start-sleep -seconds 30
+    }
+    while($null -eq $Results)
+
+    Write-log "Add computer to AD Domain"
+    $secStringPassword = (ConvertTo-SecureString "{2}" -AsPlainText -Force)[0]
+    $joinCred = New-Object pscredential -ArgumentList ([pscustomobject]@{
+        UserName = $null
+        Password = $secStringPassword
+    })
+    $addComputerSplat = @{
+        DomainName = "{0}"
+        Options = 'UnsecuredJoin', 'PasswordPass'
+        Credential = $joinCred
+        ErrorAction = "Stop"
+    }
+    Add-Computer @addComputerSplat
+
+    Write-log "Successfully added computer to AD Domain"
+}
+catch {
+    Write-log "Failed to add computer to AD Domain. Error message: $_" -Type "ERROR"
+    exit
+}
+
+try {
+    Write-Log "Enable Network discovery and File sharing"
+    # Set action to allow
+    Get-NetFirewallRule -DisplayGroup "Network Discovery" | Set-NetFirewallRule -Action Allow -Profile "Domain" -ErrorAction Stop
+    # Enabling the rule
+    Get-NetFirewallRule -DisplayGroup "Network Discovery" | Enable-NetFirewallRule
+
+    # Set action to allow
+    Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" | Set-NetFirewallRule -Action Allow -Profile "Domain" -ErrorAction Stop
+    # Enabling the rule
+    Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" | Enable-NetFirewallRule
+    Write-Log "Successfully enabled Network discovery and File sharing"
+
+}
+catch {
+    Write-log "Failed to enable Network discovery and File sharing. Error message: $_" -Type "ERROR"
+}
+
+try{
+	Unregister-ScheduledTask -TaskName "Run postreboot DomainJoin script" -Confirm:$false -ErrorAction Stop
+	Write-Log "Successfully unregistered postreboot schedule task"
+}
+catch {
+    Write-log "Failed to unregistered postreboot schedule task. Error message: $_" -Type "ERROR"
+}
+Write-Log "PostReboot script finished. System should be ready for use. Rebooting..."
+Restart-Computer -Force
+'@).Replace("{0}",$DomainName).replace("{1}",$ServerName).replace("{2}",$AdminPass).Replace("{3}",$AdminAccount).Replace("{4}",$DCIPAddress) | Add-Content "C:\Temp\postreboot.ps1"
+
+Write-log "Registering Scheduled task to run post reboot script"
+$taskname = "Run postreboot DomainJoin script"
+$taskdescription = "Run postreboot DomainJoin script"
+$action = New-ScheduledTaskAction -Execute 'Powershell.exe' -Argument '-noprofile -noninteractive -file "C:\Temp\postreboot.ps1"'
+$trigger =  New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -Action $action -Trigger $trigger -TaskName $taskname -Description $taskdescription -Settings $settings -User "System" -ErrorAction Stop
+Write-log "Sucessfully registered Scheduled task to run post reboot script"
+
+try {
+    Write-Log "Downloading Notepad++"
+    (New-Object System.Net.WebClient).DownloadFile('https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.8.1/npp.8.8.1.Installer.x64.exe', "C:\Temp\npp.8.8.1.Installer.x64.exe")
+    Write-Log "Installing Notepad++"
+    Start-Process -FilePath "C:\Temp\npp.8.8.1.Installer.x64.exe" -ArgumentList "/S" -Wait -ErrorAction Stop
+    Write-Log "Successfully installed Notepad++"
+}
+catch {
+    Write-log "Failed install Notepad++. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-Log "Downloading PSTools"
+    (New-Object System.Net.WebClient).DownloadFile('https://download.sysinternals.com/files/PSTools.zip', "C:\Temp\PSTools.zip")
+    Write-Log "Extracting PSTools"
+    Expand-Archive -path "C:\temp\PSTools.zip" -DestinationPath "C:\Temp\PSTools" -Force -ErrorAction Stop
+    Write-Log "Successfully downloaded and extracted PSTools"
+}
+catch {
+    Write-log "Failed to download PSTools. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-log "Renaming computer name from '$($env:COMPUTERNAME)' to '$ServerName'"
+    Rename-Computer -NewName $ServerName -ErrorAction Stop -Restart
+}
+catch {
+    Write-log "Failed to rename computer name. Error message: $_" -Type "ERROR"
+    exit
+}
+
+</Powershell>

@@ -1,0 +1,163 @@
+﻿<Powershell>
+Function Write-log {
+    Param(
+        $Message,
+        $Type = "INFO"
+    )
+    if (-not(Test-Path "C:\Temp")) { New-Item -Path "C:\" -Name "Temp" -ItemType Directory -Force }
+    Add-Content -Value "$(Get-Date -Format u),$Type,$Message" -Path "C:\Temp\Bootstrap.log" -Force
+}
+Set-ExecutionPolicy Unrestricted -Force
+
+Write-log "Starting bootstrap script"
+
+$DCName = "${dc_name}"
+$DomainName = "${domain_name}"
+$NetBiosDomainName = "${netbios_domainname}"
+$AdminAccount = "${admin_name}"
+$AdminPass = "${admin_pass}"
+$MemberServers = "${member_servers}"
+$MemberServers = $MemberServers -join ","
+
+(@'
+Function Write-log {
+    Param(
+        $Message,
+        $Type = "INFO"
+    )
+    if (-not(Test-Path "C:\Temp")) { New-Item -Path "C:\" -Name "Temp" -ItemType Directory -Force }
+    Add-Content -Value "$(Get-Date -Format u),$Type,$Message" -Path "C:\Temp\PromoteDC.log" -Force
+}
+Write-log "Starting PromoteDC script"
+
+$conn = test-netconnection rccad.lab -Port 389
+if($conn.TcpTestSucceeded -eq $false){
+    try {
+        Write-log "Installing required Windows Feature"
+        Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools -ErrorAction Stop
+        Write-log "Successfully installed required Windows Feature"
+    }
+    catch {
+        Write-log "Failed to install required Windows Feature. Error message: $_" -Type "ERROR"
+        exit
+    }
+
+    try {
+        Write-log "Creating AD Forest: {0}"
+        $SafePass = ConvertTo-SecureString "{2}" -AsPlainText -Force
+        Install-ADDSForest -DomainName "{0}" -SafeModeAdministratorPassword $SafePass -LogPath "C:\Temp\DCPromoLogs" -SkipPreChecks -InstallDNS -Force -ErrorAction Stop
+        Write-log "Successfully created AD Forest: {0}"
+        Restart-Computer -Force -ErrorAction Stop
+    }
+    catch {
+        Write-log "Failed to install AD Forest. Error message: $_" -Type "ERROR"
+        exit
+    }
+}
+
+try {    
+    Write-Log "Getting current Admin and making a copy"
+    $admin = Get-aduser administrator -Properties *
+    Write-Log "Admin Account found"
+
+    Write-Log "Duplicating new admin account: {3}"
+    $AdminSecuredPass = ConvertTo-SecureString "{2}" -AsPlainText -Force
+    New-ADUser -SamAccountName "{3}" -Name "{3}" -AccountPassword $AdminSecuredPass -PasswordNeverExpires $True -UserPrincipalName "{3}@rccad.lab" -Enabled $true -Server $env:COMPUTERNAME -ErrorAction Stop
+
+    Write-Log "Assigning same DomainAdmin groups to new account"
+    foreach($g in $admin.memberof){ Add-ADGroupMember -Identity $g -Members "LabAdmin" -ErrorAction Stop }
+}
+catch {
+    Write-log "Failed to create new admin account. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-Log "Creating Computer objects"
+    new-variable -Name Servers -Value "{4}".Split(",")
+    $Servers | foreach{New-ADComputer -Name $_ -AccountPassword $AdminSecuredPass -ErrorAction "Stop"}
+}
+catch {
+    Write-Log "Failed to create computer objects. Error message: $_"
+}
+
+try {
+    Write-Log "Create desktop shortcuts for DSA.msc"
+    $WScriptShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WScriptShell.CreateShortcut("C:\Users\Public\Desktop\AD Users and Computers.lnk")
+    $Shortcut.TargetPath = "dsa.msc"
+    $Shortcut.Save()
+    Write-Log "Successfully create desktop shortcuts for DSA.msc"
+}
+catch {
+    Write-log "Failed to create desktop shortcuts. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-Log "Enable Network discovery and File sharing"
+    # Set action to allow
+    Get-NetFirewallRule -DisplayGroup "Network Discovery" | Set-NetFirewallRule -Action Allow -Profile "Domain" -ErrorAction Stop
+    # Enabling the rule
+    Get-NetFirewallRule -DisplayGroup "Network Discovery" | Enable-NetFirewallRule
+
+    # Set action to allow
+    Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" | Set-NetFirewallRule -Action Allow -Profile "Domain" -ErrorAction Stop
+    # Enabling the rule
+    Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" | Enable-NetFirewallRule
+    Write-Log "Successfully enabled Network discovery and File sharing"
+
+}
+catch {
+    Write-log "Failed to enable Network discovery and File sharing. Error message: $_" -Type "ERROR"
+}
+
+try{
+	Unregister-ScheduledTask -TaskName "Run postreboot PromoteDC script" -Confirm:$false -ErrorAction Stop
+	Write-Log "Successfully unregistered postreboot schedule task"
+}
+catch {
+    Write-log "Failed to unregistered postreboot schedule task. Error message: $_" -Type "ERROR"
+}
+Write-Log "PostReboot script finished. System should be ready for use. Rebooting..."
+Restart-Computer -Force
+'@).Replace("{0}",$DomainName).replace("{2}",$AdminPass).Replace("{3}",$AdminAccount).Replace("{4}",$MemberServers) | Add-Content "C:\Temp\postreboot.ps1"
+
+Write-log "Registering Scheduled task to run post reboot script"
+$taskname = "Run postreboot PromoteDC script"
+$taskdescription = "Run postreboot PromoteDC script"
+$action = New-ScheduledTaskAction -Execute 'Powershell.exe' -Argument '-noprofile -noninteractive -file "C:\Temp\postreboot.ps1"'
+$trigger =  New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -Action $action -Trigger $trigger -TaskName $taskname -Description $taskdescription -Settings $settings -User "System" -ErrorAction Stop
+Write-log "Sucessfully registered Scheduled task to run post reboot script"
+
+try {
+    Write-Log "Downloading Notepad++"
+    (New-Object System.Net.WebClient).DownloadFile('https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.8.1/npp.8.8.1.Installer.x64.exe', "C:\Temp\npp.8.8.1.Installer.x64.exe")
+    Write-Log "Installing Notepad++"
+    Start-Process -FilePath "C:\Temp\npp.8.8.1.Installer.x64.exe" -ArgumentList "/S" -Wait -ErrorAction Stop
+    Write-Log "Successfully installed Notepad++"
+}
+catch {
+    Write-log "Failed install Notepad++. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-Log "Downloading PSTools"
+    (New-Object System.Net.WebClient).DownloadFile('https://download.sysinternals.com/files/PSTools.zip', "C:\Temp\PSTools.zip")
+    Write-Log "Extracting PSTools"
+    Expand-Archive -path "C:\temp\PSTools.zip" -DestinationPath "C:\Temp\PSTools" -Force -ErrorAction Stop
+    Write-Log "Successfully downloaded and extracted PSTools"
+}
+catch {
+    Write-log "Failed to download PSTools. Error message: $_" -Type "ERROR"
+}
+
+try {
+    Write-log "Renaming computer name from '$($env:COMPUTERNAME)' to '$DCName'"
+    Rename-Computer -NewName $DCName -ErrorAction Stop -Restart
+}
+catch {
+    Write-log "Failed to rename computer name. Error message: $_" -Type "ERROR"
+    exit
+}
+</Powershell>
